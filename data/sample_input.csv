@@ -1,0 +1,7 @@
+﻿Shipment_ID,Weight,Weight_Unit,Distance,Distance_Unit,Transport_Mode
+SAMPLE_001,1000,KGS,1200,KMS,road
+SAMPLE_002,,kg,800,km,rail
+SAMPLE_003,2200,lbs,500,mile,ocean
+SAMPLE_004,2.5,WT_UNKNOWN,300,km,air
+SAMPLE_005,10,t,oops,km,
+SAMPLE_006,5,kg,100,km,UNKNOWN_MODE
