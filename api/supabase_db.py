@@ -1,71 +1,176 @@
-"""
-supabase_db.py（骨架）
+﻿"""api/supabase_db.py
 
-数据库交互层（Supabase）
+Phase 2: Supabase "Rule Memory" for unit mappings.
 
-建议实践：
-- 统一在此处创建/复用 Supabase Client
-- 所有表操作都显式带 tenant_id（或使用 RLS 强制隔离）
-- 对外仅暴露“业务语义”函数，避免在 UI 层散落 SQL/表名
+This module provides a small, robust wrapper around the `supabase` Python client.
+It is intentionally conservative:
+- Uses `streamlit` to read secrets from `st.secrets`.
+- Catches network/cloud exceptions and degrades safely (empty dict / False) so UI
+  never hard-crashes due to transient Supabase issues.
+
+Expected Supabase table:
+- unit_mappings
+  - tenant_id (text)
+  - raw_unit (text)
+  - std_unit (text)
+  - UNIQUE (tenant_id, raw_unit)
+
+Secrets contract (Streamlit):
+- st.secrets["supabase"]["url"]
+- st.secrets["supabase"]["key"]
+
+NOTE: "tamper-proof" is handled at the audit/PDF layer; this module only stores
+unit mapping rules.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
+import streamlit as st
 
-def create_supabase_client(*, url: str, key: str) -> Any:
-    """
-    创建 Supabase 客户端（骨架）。
-
-    参数：
-    - url：Supabase Project URL
-    - key：Service role key 或 anon key（按部署场景选择）
-    """
-
-    # from supabase import create_client
-    # return create_client(url, key)
-    raise NotImplementedError("TODO: 创建并返回 supabase client（supabase-py）")
+try:
+    # `supabase-py` (supabase) client
+    from supabase import Client, create_client
+except Exception:  # pragma: no cover
+    Client = Any  # type: ignore[misc,assignment]
+    create_client = None  # type: ignore[assignment]
 
 
-def get_tenant_settings(client: Any, *, tenant_id: str) -> Dict[str, Any]:
-    """
-    获取租户配置（骨架）。
-
-    用途示例：
-    - 自定义排放因子来源
-    - 功能开关（商业版套餐差异）
-    """
-
-    raise NotImplementedError("TODO: 从 Supabase 表中读取 tenant settings")
+logger = logging.getLogger(__name__)
 
 
-def save_job_record(client: Any, *, tenant_id: str, job_payload: Dict[str, Any]) -> str:
-    """
-    保存一条 ETL 作业记录（骨架）。
+class SupabaseManager:
+    """Supabase access layer for tenant-specific unit mappings."""
 
-    返回：
-    - job_id：用于后续查询进度/审计
-    """
+    _TABLE_UNIT_MAPPINGS = "unit_mappings"
 
-    raise NotImplementedError("TODO: 写入 jobs 表并返回 job_id")
+    def __init__(self) -> None:
+        """Initialize the Supabase client from Streamlit secrets.
 
+        This constructor must read:
+        - st.secrets["supabase"]["url"]
+        - st.secrets["supabase"]["key"]
 
-def save_audit_events(client: Any, *, tenant_id: str, job_id: str, events: list[Dict[str, Any]]) -> None:
-    """
-    批量写入审计事件（骨架）。
-    """
+        If initialization fails, `self.client` becomes None and methods will
+        gracefully degrade.
+        """
 
-    raise NotImplementedError("TODO: 写入 audit_events 表（建议批量 upsert）")
+        self.client: Optional[Client] = None
 
+        try:
+            if create_client is None:
+                raise ImportError(
+                    "Supabase client is not available. Install dependency: pip install supabase"
+                )
 
-def get_user_subscription(client: Any, *, tenant_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    获取用户订阅状态（骨架）。
+            url = st.secrets["supabase"]["url"]
+            key = st.secrets["supabase"]["key"]
 
-    说明：
-    - 可从你自建表或 Stripe 同步表读取
-    """
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError("Invalid st.secrets['supabase']['url']")
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("Invalid st.secrets['supabase']['key']")
 
-    raise NotImplementedError("TODO: 读取订阅信息并返回")
+            self.client = create_client(url.strip(), key.strip())
+            logger.info("SupabaseManager initialized.")
+        except Exception as exc:
+            # Do not crash the app on cloud misconfig; fail closed.
+            self.client = None
+            logger.exception("SupabaseManager init failed (degrading to no-op): %s", exc)
 
+    def get_tenant_mappings(self, tenant_id: str) -> Dict[str, str]:
+        """Fetch unit mappings for a tenant.
+
+        Args:
+            tenant_id: Tenant identifier.
+
+        Returns:
+            Dict mapping raw_unit -> std_unit. Returns {} on any failure.
+        """
+
+        if self.client is None:
+            return {}
+
+        try:
+            tenant_id = str(tenant_id).strip()
+            if not tenant_id:
+                return {}
+
+            resp = (
+                self.client.table(self._TABLE_UNIT_MAPPINGS)
+                .select("raw_unit,std_unit")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
+
+            rows = getattr(resp, "data", None)
+            if not rows:
+                return {}
+
+            mapping: Dict[str, str] = {}
+            for row in rows:
+                raw_unit = str(row.get("raw_unit", "")).strip()
+                std_unit = str(row.get("std_unit", "")).strip()
+                if raw_unit and std_unit:
+                    mapping[raw_unit] = std_unit
+
+            return mapping
+        except Exception as exc:
+            logger.exception("get_tenant_mappings failed (tenant_id=%s): %s", tenant_id, exc)
+            return {}
+
+    def add_mapping(self, tenant_id: str, raw_unit: str, std_unit: str) -> bool:
+        """Insert or update a unit mapping for a tenant.
+
+        Uses upsert to avoid UNIQUE(tenant_id, raw_unit) conflicts.
+
+        Args:
+            tenant_id: Tenant identifier.
+            raw_unit: Raw unit string from user data (e.g., "三大箱").
+            std_unit: Standard unit (e.g., "t").
+
+        Returns:
+            True if successful, else False.
+        """
+
+        if self.client is None:
+            return False
+
+        try:
+            tenant_id = str(tenant_id).strip()
+            raw_unit = str(raw_unit).strip()
+            std_unit = str(std_unit).strip()
+
+            if not tenant_id or not raw_unit or not std_unit:
+                return False
+
+            payload = {
+                "tenant_id": tenant_id,
+                "raw_unit": raw_unit,
+                "std_unit": std_unit,
+            }
+
+            table = self.client.table(self._TABLE_UNIT_MAPPINGS)
+
+            # Prefer explicit conflict target when supported.
+            try:
+                resp = table.upsert(payload, on_conflict="tenant_id,raw_unit").execute()
+            except TypeError:
+                # Older supabase-py versions may not support on_conflict kw.
+                resp = table.upsert(payload).execute()
+
+            # If Supabase returns a payload, treat as success; otherwise still
+            # consider it successful if no exception was thrown.
+            _ = getattr(resp, "data", None)
+            return True
+        except Exception as exc:
+            logger.exception(
+                "add_mapping failed (tenant_id=%s raw_unit=%s std_unit=%s): %s",
+                tenant_id,
+                raw_unit,
+                std_unit,
+                exc,
+            )
+            return False

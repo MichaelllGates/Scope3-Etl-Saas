@@ -11,3 +11,4 @@ __pycache__/
 
 # 忽略 Mac 系统自动生成的垃圾文件
 .DS_Store
+.streamlit/secrets.toml

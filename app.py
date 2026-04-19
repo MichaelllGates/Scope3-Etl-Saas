@@ -9,13 +9,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from api.supabase_db import SupabaseManager
 from core.auditor import AuditReportGenerator
 from core.calculator import Scope3Calculator
 from core.cleaner import Scope3Cleaner
 
 
-st.set_page_config(page_title="Scope 3 ETL SaaS", layout="centered")
+st.set_page_config(page_title="Scope 3 ETL SaaS", layout="wide")
 
+# Phase 2: Rule Memory (Supabase)
+db = SupabaseManager()
+
+# CSS injection must happen at the very beginning of the app to avoid flicker.
 st.markdown(
     """
 <style>
@@ -73,8 +78,9 @@ st.markdown(
     box-shadow: 0 10px 24px rgba(2, 6, 23, 0.12) !important;
   }
 
-  /* Make audit download visually distinct */
-  div[data-testid="stDownloadButton"] button[aria-label*="Download PDF Audit Log"] {
+  /* Make audit download visually distinct (best-effort selector) */
+  div[data-testid="stDownloadButton"] button[aria-label*="Download PDF Audit Log"],
+  div[data-testid="stDownloadButton"] button[aria-label*="PDF Audit Log"] {
     background: linear-gradient(90deg, #0f172a 0%, #111827 45%, #1f2937 100%) !important;
     box-shadow: 0 14px 36px rgba(17, 24, 39, 0.22) !important;
   }
@@ -109,6 +115,55 @@ st.markdown(
 )
 
 
+# ---------------------------- Auth Wall ----------------------------
+st.session_state.setdefault("authenticated", False)
+st.session_state.setdefault("username", None)
+
+_VALID_USERS: dict[str, str] = {
+    "admin": "scopify2026",
+    "demo": "123456",
+}
+
+
+def _logout() -> None:
+    st.session_state["authenticated"] = False
+    st.session_state["username"] = None
+    st.session_state.pop("result_df", None)
+    st.session_state.pop("cleaned_excel_bytes", None)
+    st.session_state.pop("audit_pdf_bytes", None)
+    st.rerun()
+
+
+def _render_login_screen() -> None:
+    left, center, right = st.columns([1.15, 1.0, 1.15])
+    with center:
+        st.title("🔐 Welcome to Scopify")
+        st.caption("Secure demo login. Zero-retention ETL runs in memory.")
+
+        username = st.text_input("Username", value="", placeholder="admin or demo")
+        password = st.text_input("Password", value="", type="password")
+
+        if st.button("Sign in", type="primary", use_container_width=True):
+            expected = _VALID_USERS.get((username or "").strip())
+            if expected is not None and password == expected:
+                st.session_state["authenticated"] = True
+                st.session_state["username"] = (username or "").strip()
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+        st.caption("Demo accounts: admin / scopify2026 · demo / 123456")
+
+
+if not st.session_state["authenticated"]:
+    _render_login_screen()
+    st.stop()
+
+
+tenant_id = str(st.session_state.get("username") or "").strip() or "demo"
+
+
+# ---------------------------- Helpers ----------------------------
 def _excel_engine() -> str:
     try:
         import xlsxwriter  # noqa: F401
@@ -134,10 +189,8 @@ def _read_uploaded_file(uploaded_file: st.runtime.uploaded_file_manager.Uploaded
     raise ValueError("Unsupported file type. Please upload a .csv or .xlsx file.")
 
 
-def _require_columns(df: pd.DataFrame, required: Iterable[str]) -> None:
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+def _missing_columns(df: pd.DataFrame, required: Iterable[str]) -> list[str]:
+    return [col for col in required if col not in df.columns]
 
 
 def _append_flag(existing_flag: pd.Series, mask: pd.Series, flag: str) -> pd.Series:
@@ -225,16 +278,14 @@ def _standardize_for_engine(cleaned_df: pd.DataFrame) -> pd.DataFrame:
         .str.lower()
     )
 
-    weight_t = pd.Series(np.nan, index=df.index, dtype="float")
-    weight_t = weight_t.mask(w_unit == "t", weight_raw)
-    weight_t = weight_t.mask(w_unit == "kg", weight_raw / 1000.0)
-    weight_t = weight_t.mask(w_unit == "lbs", weight_raw * 0.00045359237)
-    df["Std_Weight (t)"] = weight_t
+    df["Std_Weight (t)"] = np.nan
+    df.loc[w_unit == "t", "Std_Weight (t)"] = weight_raw
+    df.loc[w_unit == "kg", "Std_Weight (t)"] = weight_raw / 1000.0
+    df.loc[w_unit == "lbs", "Std_Weight (t)"] = weight_raw * 0.00045359237
 
-    distance_km = pd.Series(np.nan, index=df.index, dtype="float")
-    distance_km = distance_km.mask(d_unit == "km", distance_raw)
-    distance_km = distance_km.mask(d_unit == "mile", distance_raw * 1.609344)
-    df["Std_Distance (km)"] = distance_km
+    df["Std_Distance (km)"] = np.nan
+    df.loc[d_unit == "km", "Std_Distance (km)"] = distance_raw
+    df.loc[d_unit == "mile", "Std_Distance (km)"] = distance_raw * 1.609344
 
     missing_weight = df["Std_Weight (t)"].isna()
     missing_distance = df["Std_Distance (km)"].isna()
@@ -256,8 +307,11 @@ def _generate_audit_pdf_bytes(df_for_audit: pd.DataFrame) -> bytes:
 
 
 with st.sidebar:
-    st.markdown("### Scope 3 ETL SaaS")
-    st.caption("Minimal UI · Zero-Retention")
+    st.markdown("### Scopify")
+    st.caption(f"Signed in as: `{tenant_id}`")
+
+    if st.button("Logout", use_container_width=True):
+        _logout()
 
     sample_df = _build_sample_df()
     st.download_button(
@@ -265,12 +319,20 @@ with st.sidebar:
         data=_df_to_excel_bytes(sample_df, sheet_name="Sample Data"),
         file_name="scope3_sample_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width='stretch',
+        use_container_width=True,
     )
 
 
-st.title("🌱 Scope 3 ETL Engine")
-st.caption("Premium, in-memory ETL. Zero-retention policy: uploaded files are processed securely in memory and never stored.")
+top_left, top_right = st.columns([0.78, 0.22])
+with top_left:
+    st.title("🌱 Scope 3 ETL Engine")
+    st.caption(
+        "Premium, in-memory ETL. Zero-retention policy: uploaded files are processed securely in memory and never stored."
+    )
+with top_right:
+    if st.button("Logout", use_container_width=True):
+        _logout()
+
 
 uploaded_file = st.file_uploader("Data Upload (.csv / .xlsx)", type=["csv", "xlsx"])
 
@@ -281,64 +343,71 @@ if uploaded_file is not None:
     except Exception as exc:
         st.error(f"Failed to read file: {exc}")
 
+required_cols = ["Weight", "Weight_Unit", "Distance", "Distance_Unit", "Transport_Mode"]
+
 if raw_df is not None:
-    _require_columns(raw_df, ["Weight", "Weight_Unit", "Distance", "Distance_Unit", "Transport_Mode"])
+    missing = _missing_columns(raw_df, required_cols)
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+    else:
+        st.markdown("#### Raw Data Preview")
+        st.dataframe(raw_df.head(5), use_container_width=True)
 
-    st.markdown("#### Raw Data Preview")
-    st.dataframe(raw_df.head(5), width='stretch')
+        run_clicked = st.button("Run ETL & Calculate", type="primary", use_container_width=True)
+        if run_clicked:
+            try:
+                with st.spinner("Processing data securely in memory (Zero-Retention)..."):
+                    custom_rules = db.get_tenant_mappings(tenant_id=tenant_id)
 
-    run_clicked = st.button("Run ETL & Calculate", type="primary", width='stretch')
-    if run_clicked:
-        try:
-            with st.spinner("Processing data securely in memory (Zero-Retention)..."):
-                cleaner = Scope3Cleaner()
-                cleaned_df = cleaner.clean_logistics_data(raw_df, weight_col="Weight_Unit", distance_col="Distance_Unit")
+                    cleaner = Scope3Cleaner(custom_mapping=custom_rules)
+                    cleaned_df = cleaner.clean_logistics_data(
+                        raw_df,
+                        weight_col="Weight_Unit",
+                        distance_col="Distance_Unit",
+                    )
 
-                standardized_df = _standardize_for_engine(cleaned_df)
+                    standardized_df = _standardize_for_engine(cleaned_df)
 
-                calculator = Scope3Calculator(tenant_id="demo")
-                result_df = calculator.calculate_emissions(
-                    df=standardized_df,
-                    weight_val_col="Std_Weight (t)",
-                    distance_val_col="Std_Distance (km)",
-                    mode_col="Transport_Mode",
-                )
+                    calculator = Scope3Calculator(tenant_id=tenant_id)
+                    result_df = calculator.calculate_emissions(
+                        df=standardized_df,
+                        weight_val_col="Std_Weight (t)",
+                        distance_val_col="Std_Distance (km)",
+                        mode_col="Transport_Mode",
+                    )
 
-                result_df["Carbon_Emission (tCO2e)"] = result_df["Emissions_tCO2e"]
-                result_df["Review_Flag"] = (
-                    result_df.get("ETL_Review_Flag", "")
-                    .astype("string")
-                    .fillna("")
-                    .str.strip()
-                    .replace({"Clean": ""})
-                )
+                    result_df["Carbon_Emission (tCO2e)"] = result_df["Emissions_tCO2e"]
+                    result_df["Review_Flag"] = (
+                        result_df.get("ETL_Review_Flag", "")
+                        .astype("string")
+                        .fillna("")
+                        .str.strip()
+                        .replace({"Clean": ""})
+                    )
 
-                st.session_state["result_df"] = result_df
+                    st.session_state["result_df"] = result_df
+                    st.session_state["cleaned_excel_bytes"] = _df_to_excel_bytes(result_df, sheet_name="ETL Result")
 
-                st.session_state["cleaned_excel_bytes"] = _df_to_excel_bytes(result_df, sheet_name="ETL Result")
-                st.session_state["audit_pdf_bytes"] = _generate_audit_pdf_bytes(
-                    result_df[
-                        [
-                            col
-                            for col in [
-                                "Shipment_ID",
-                                "Std_Weight (t)",
-                                "Std_Distance (km)",
-                                "Data_Tier",
-                                "Review_Flag",
-                                "Carbon_Emission (tCO2e)",
-                            ]
-                            if col in result_df.columns
+                    audit_cols = [
+                        col
+                        for col in [
+                            "Shipment_ID",
+                            "Std_Weight (t)",
+                            "Std_Distance (km)",
+                            "Data_Tier",
+                            "Review_Flag",
+                            "Carbon_Emission (tCO2e)",
                         ]
-                    ].copy()
-                )
+                        if col in result_df.columns
+                    ]
+                    st.session_state["audit_pdf_bytes"] = _generate_audit_pdf_bytes(result_df[audit_cols].copy())
 
-            st.success("ETL complete. Results are ready.")
-        except Exception as exc:
-            st.session_state.pop("result_df", None)
-            st.session_state.pop("cleaned_excel_bytes", None)
-            st.session_state.pop("audit_pdf_bytes", None)
-            st.error(f"Processing failed: {exc}")
+                st.success("ETL complete. Results are ready.")
+            except Exception as exc:
+                st.session_state.pop("result_df", None)
+                st.session_state.pop("cleaned_excel_bytes", None)
+                st.session_state.pop("audit_pdf_bytes", None)
+                st.error(f"Processing failed: {exc}")
 
 
 result_df = st.session_state.get("result_df")
@@ -351,11 +420,11 @@ if isinstance(result_df, pd.DataFrame):
 
         tab_ok, tab_review = st.tabs(["✅ Clean", "⚠️ Needs Review"])
         with tab_ok:
-            st.dataframe(ok_df, width='stretch')
+            st.dataframe(ok_df, use_container_width=True)
         with tab_review:
-            st.dataframe(review_df, uwidth='stretch')
+            st.dataframe(review_df, use_container_width=True)
     else:
-        st.dataframe(result_df, uwidth='stretch')
+        st.dataframe(result_df, use_container_width=True)
 
     st.markdown("#### Exports")
     c1, c2 = st.columns(2)
@@ -369,7 +438,7 @@ if isinstance(result_df, pd.DataFrame):
             data=cleaned_excel_bytes if isinstance(cleaned_excel_bytes, (bytes, bytearray)) else b"",
             file_name="Scope3_Cleaned_Result.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width='stretch',
+            use_container_width=True,
         )
 
     with c2:
@@ -378,5 +447,27 @@ if isinstance(result_df, pd.DataFrame):
             data=audit_pdf_bytes if isinstance(audit_pdf_bytes, (bytes, bytearray)) else b"",
             file_name="Scope3_Audit_Log_V1.pdf",
             mime="application/pdf",
-            width='stretch',
+            use_container_width=True,
         )
+
+
+with st.expander("🧠 Teach the Engine (Add Custom Unit Mapping)", expanded=False):
+    st.caption("Save a custom unit rule to Supabase. The engine will remember it next time.")
+
+    with st.form("rule_memory_form"):
+        raw_input = st.text_input("Raw/Dirty Unit (e.g., 三大箱)")
+        std_input = st.selectbox("Map to Standard Unit", ["t", "kg", "lbs", "km", "mile"])
+        submitted = st.form_submit_button("Save Rule to Cloud")
+
+    if submitted:
+        raw_unit = (raw_input or "").strip()
+        std_unit = (std_input or "").strip()
+
+        if not raw_unit:
+            st.error("Please enter a raw/dirty unit.")
+        else:
+            ok = db.add_mapping(tenant_id=tenant_id, raw_unit=raw_unit, std_unit=std_unit)
+            if ok:
+                st.success("Rule saved! The engine will remember this next time.")
+            else:
+                st.error("Failed to save rule. Check Supabase secrets/network and try again.")
