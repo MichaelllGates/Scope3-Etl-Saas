@@ -7,8 +7,8 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
+import streamlit as st
 
 from api.supabase_db import SupabaseManager
 from core.auditor import AuditReportGenerator
@@ -18,7 +18,7 @@ from core.cleaner import Scope3Cleaner
 
 st.set_page_config(page_title="Scope 3 ETL SaaS", layout="wide")
 
-# Phase 2: Rule Memory (Supabase)
+# Phase 2+: Rule Memory + dynamic factors (Supabase)
 db = SupabaseManager()
 
 # CSS injection must happen at the very beginning of the app to avoid flicker.
@@ -294,6 +294,7 @@ def _standardize_for_engine(cleaned_df: pd.DataFrame) -> pd.DataFrame:
     df["ETL_Review_Flag"] = _append_flag(df["ETL_Review_Flag"], missing_weight, "Needs Manual Review: Weight")
     df["ETL_Review_Flag"] = _append_flag(df["ETL_Review_Flag"], missing_distance, "Needs Manual Review: Distance")
 
+    # Keep an initial tier; the calculator will overwrite when it computes emissions.
     df["Data_Tier"] = np.where((~missing_weight) & (~missing_distance), "Primary", "Estimated")
 
     return df
@@ -360,6 +361,7 @@ if raw_df is not None:
                 with st.spinner("Processing data securely in memory (Zero-Retention)..."):
                     custom_rules = db.get_tenant_mappings(tenant_id=tenant_id)
                     ef_dict = db.get_emission_factors()
+                    spend_ef = db.get_spend_factors()
 
                     cleaner = Scope3Cleaner(custom_mapping=custom_rules)
                     cleaned_df = cleaner.clean_logistics_data(
@@ -370,21 +372,16 @@ if raw_df is not None:
 
                     standardized_df = _standardize_for_engine(cleaned_df)
 
-                    calculator = Scope3Calculator(tenant_id=tenant_id, ef_mapping=ef_dict)
+                    calculator = Scope3Calculator(
+                        tenant_id=tenant_id,
+                        ef_mapping=ef_dict,
+                        spend_ef_mapping=spend_ef,
+                    )
                     result_df = calculator.calculate_emissions(
                         df=standardized_df,
                         weight_val_col="Std_Weight (t)",
                         distance_val_col="Std_Distance (km)",
                         mode_col="Transport_Mode",
-                    )
-
-                    result_df["Carbon_Emission (tCO2e)"] = result_df["Emissions_tCO2e"]
-                    result_df["Review_Flag"] = (
-                        result_df.get("ETL_Review_Flag", "")
-                        .astype("string")
-                        .fillna("")
-                        .str.strip()
-                        .replace({"Clean": ""})
                     )
 
                     st.session_state["result_df"] = result_df
@@ -394,11 +391,10 @@ if raw_df is not None:
                         col
                         for col in [
                             "Shipment_ID",
-                            "Std_Weight (t)",
-                            "Std_Distance (km)",
+                            "Applied_Emission_Factor",
+                            "Carbon_Emission (tCO2e)",
                             "Data_Tier",
                             "Review_Flag",
-                            "Carbon_Emission (tCO2e)",
                         ]
                         if col in result_df.columns
                     ]
@@ -416,16 +412,7 @@ result_df = st.session_state.get("result_df")
 if isinstance(result_df, pd.DataFrame):
     st.markdown("### 📊 Executive Overview")
 
-    emissions_col = None
-    for candidate in ("Carbon_Emission", "Carbon_Emission (tCO2e)", "Emissions_tCO2e"):
-        if candidate in result_df.columns:
-            emissions_col = candidate
-            break
-
-    if emissions_col is None:
-        emissions = pd.Series(np.nan, index=result_df.index, dtype="float")
-    else:
-        emissions = pd.to_numeric(result_df[emissions_col], errors="coerce")
+    emissions = pd.to_numeric(result_df.get("Carbon_Emission (tCO2e)", np.nan), errors="coerce")
 
     total_rows = int(len(result_df))
     total_emissions = float(np.nansum(emissions.to_numpy(dtype=float))) if total_rows else 0.0
@@ -439,13 +426,22 @@ if isinstance(result_df, pd.DataFrame):
             flags = result_df["Review_Flag"].astype("string").fillna("").str.strip()
             clean_rate = float(((flags == "Clean") | (flags == "")).mean() * 100.0)
 
-    k1, k2, k3 = st.columns(3)
+    spend_pct = 0.0
+    activity_pct = 0.0
+    if total_rows and "Data_Tier" in result_df.columns:
+        tiers = result_df["Data_Tier"].astype("string").fillna("").str.strip()
+        spend_pct = float((tiers == "Estimated (Spend-based)").mean() * 100.0)
+        activity_pct = float((tiers == "Primary (Activity-based)").mean() * 100.0)
+
+    k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric("Total Rows Processed", f"{total_rows}")
     with k2:
         st.metric("Total Carbon Emissions", f"{total_emissions:.2f}")
     with k3:
         st.metric("Clean Data Rate", f"{clean_rate:.1f}%")
+    with k4:
+        st.metric("Spend-based vs. Activity-based Ratio", f"{spend_pct:.1f}% / {activity_pct:.1f}%")
 
     if emissions.notna().any():
         c_left, c_right = st.columns(2)
@@ -559,5 +555,3 @@ with st.expander("🧠 Teach the Engine (Add Custom Unit Mapping)", expanded=Fal
                 st.success("Rule saved! The engine will remember this next time.")
             else:
                 st.error("Failed to save rule. Check Supabase secrets/network and try again.")
-
-

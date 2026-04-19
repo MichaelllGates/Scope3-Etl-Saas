@@ -1,6 +1,6 @@
 ﻿"""api/supabase_db.py
 
-Phase 2+: Supabase "Rule Memory" + dynamic Emission Factors.
+Phase 2+: Supabase "Rule Memory" + dynamic Emission Factors + Spend Factors.
 
 This module provides a small, robust wrapper around the `supabase` Python client.
 It is intentionally conservative:
@@ -18,6 +18,10 @@ Tables expected:
 - emission_factors
   - transport_mode (text)
   - factor_value (numeric)
+
+- spend_emission_factors
+  - sector (text)
+  - kg_co2e_per_usd (numeric)
 
 Secrets contract (Streamlit):
 - st.secrets["supabase"]["url"]
@@ -51,10 +55,11 @@ DEFAULT_EF_MAPPING: Dict[str, float] = {
 
 
 class SupabaseManager:
-    """Supabase access layer for tenant-specific unit mappings and emission factors."""
+    """Supabase access layer for tenant-specific unit mappings and factor tables."""
 
     _TABLE_UNIT_MAPPINGS = "unit_mappings"
     _TABLE_EMISSION_FACTORS = "emission_factors"
+    _TABLE_SPEND_FACTORS = "spend_emission_factors"
 
     def __init__(self) -> None:
         """Initialize the Supabase client from Streamlit secrets.
@@ -204,8 +209,48 @@ class SupabaseManager:
                 except Exception:
                     continue
 
-            # Ensure we always have at least the fallback.
             return ef or DEFAULT_EF_MAPPING.copy()
         except Exception as exc:
             logger.exception("get_emission_factors failed (fallback to defaults): %s", exc)
             return DEFAULT_EF_MAPPING.copy()
+
+    def get_spend_factors(self) -> Dict[str, float]:
+        """Fetch spend-based emission factors.
+
+        Queries `spend_emission_factors` and returns a mapping:
+            {sector(lowercased): kg_co2e_per_usd(float)}
+
+        Graceful fallback:
+        - If Supabase is unavailable or query fails, returns an empty dict.
+        """
+
+        if self.client is None:
+            return {}
+
+        try:
+            resp = (
+                self.client.table(self._TABLE_SPEND_FACTORS)
+                .select("sector,kg_co2e_per_usd")
+                .execute()
+            )
+
+            rows = getattr(resp, "data", None)
+            if not rows:
+                return {}
+
+            out: Dict[str, float] = {}
+            for row in rows:
+                sector = str(row.get("sector", "")).strip().lower()
+                value = row.get("kg_co2e_per_usd", None)
+
+                if not sector:
+                    continue
+                try:
+                    out[sector] = float(value)
+                except Exception:
+                    continue
+
+            return out
+        except Exception as exc:
+            logger.exception("get_spend_factors failed (fallback to empty): %s", exc)
+            return {}

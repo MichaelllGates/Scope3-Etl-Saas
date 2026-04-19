@@ -1,6 +1,6 @@
 ﻿"""core/auditor.py
 
-Enterprise-grade PDF audit logging for Scope 3 ETL Micro-SaaS.
+Enterprise-grade PDF audit logging for Scopify (Scope 3 ETL Micro-SaaS).
 
 This module generates an immutable-style (tamper-evident) PDF audit log from a fully
 processed pandas DataFrame.
@@ -13,7 +13,7 @@ Design goals:
 
 NOTE on "tamper-proof": PDFs are not inherently tamper-proof without signing.
 This implementation adds a SHA-256 data fingerprint into the PDF to make edits
-detectable (tamper-evident) in enterprise audit workflows.
+ detectable (tamper-evident) in enterprise audit workflows.
 """
 
 from __future__ import annotations
@@ -23,13 +23,11 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 try:
-    # fpdf2 and fpdf both expose `FPDF` with mostly compatible APIs.
     from fpdf import FPDF
 except Exception as exc:  # pragma: no cover
     raise ImportError(
@@ -39,8 +37,6 @@ except Exception as exc:  # pragma: no cover
 
 @dataclass(frozen=True)
 class AuditMetrics:
-    """Executive summary metrics extracted from the processed DataFrame."""
-
     total_rows: int
     total_emissions_tco2e: float
     primary_pct: float
@@ -50,29 +46,24 @@ class AuditMetrics:
 class AuditReportGenerator:
     """Generate an enterprise-style PDF audit log for Scope 3 ETL processing."""
 
-    # Expected input columns (as per product contract)
+    # Required proof columns
     COL_SHIPMENT_ID = "Shipment_ID"
-    COL_STD_WEIGHT = "Std_Weight (t)"
-    COL_STD_DISTANCE = "Std_Distance (km)"
+    COL_APPLIED_FACTOR = "Applied_Emission_Factor"
+    COL_CARBON = "Carbon_Emission (tCO2e)"
     COL_DATA_TIER = "Data_Tier"
     COL_REVIEW_FLAG = "Review_Flag"
-    COL_EMISSIONS = "Carbon_Emission (tCO2e)"
+
+    # Fallback column sources (for robustness)
+    _ALT_CARBON = ("Carbon_Emission (tCO2e)", "Emissions_tCO2e", "Carbon_Emission")
+    _ALT_REVIEW = ("Review_Flag", "ETL_Review_Flag")
 
     SYSTEM_VERSION = "Scope 3 ETL Engine V1.0"
     HEADER_TEXT = "CONFIDENTIAL & IMMUTABLE LOG"
 
-    def __init__(self, *, company_name: str = "Scope 3 ETL"):
+    def __init__(self, *, company_name: str = "Scopify"):
         self.company_name = company_name
 
-    # ---------------------------- Public API ----------------------------
     def generate_pdf_log(self, df: pd.DataFrame, output_path: str) -> None:
-        """Generate a PDF audit log for a fully processed DataFrame.
-
-        Args:
-            df: Processed pandas DataFrame.
-            output_path: File path for the generated PDF.
-        """
-
         safe_df = self._normalize_input_df(df)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fingerprint = self._compute_dataframe_fingerprint(safe_df)
@@ -81,43 +72,52 @@ class AuditReportGenerator:
         pdf = self._create_pdf()
         self._render_section_header(pdf, timestamp=timestamp, fingerprint=fingerprint)
         self._render_section_exec_summary(pdf, metrics=metrics)
-        self._render_section_exceptions(pdf, df=safe_df)
+        self._render_section_detailed_audit(pdf, df=safe_df)
 
         self._write_pdf(pdf, output_path=output_path)
 
     # ------------------------- Data preparation -------------------------
     def _normalize_input_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Return a safe copy of df to protect the caller from side effects."""
-
         if df is None:
             return pd.DataFrame()
         if not isinstance(df, pd.DataFrame):
             raise TypeError(f"df must be a pandas DataFrame, got: {type(df)}")
         return df.copy()
 
-    def _compute_metrics(self, df: pd.DataFrame) -> AuditMetrics:
-        """Compute executive summary metrics with defensive defaults."""
+    def _resolve_carbon_series(self, df: pd.DataFrame) -> pd.Series:
+        for col in self._ALT_CARBON:
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype="float")
 
+    def _resolve_factor_series(self, df: pd.DataFrame) -> pd.Series:
+        if self.COL_APPLIED_FACTOR in df.columns:
+            return pd.to_numeric(df[self.COL_APPLIED_FACTOR], errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype="float")
+
+    def _resolve_review_series(self, df: pd.DataFrame) -> pd.Series:
+        for col in self._ALT_REVIEW:
+            if col in df.columns:
+                s = df[col].astype("string").fillna("").str.strip()
+                return s.replace({"Clean": ""})
+        return pd.Series("", index=df.index, dtype="string")
+
+    def _compute_metrics(self, df: pd.DataFrame) -> AuditMetrics:
         total_rows = int(len(df))
 
-        # Total emissions: sum of the emissions column, ignoring NaNs.
-        if self.COL_EMISSIONS in df.columns:
-            emissions = pd.to_numeric(df[self.COL_EMISSIONS], errors="coerce")
-            total_emissions = float(np.nansum(emissions.to_numpy(dtype=float)))
-        else:
-            total_emissions = 0.0
+        emissions = self._resolve_carbon_series(df)
+        total_emissions = float(np.nansum(emissions.to_numpy(dtype=float))) if total_rows else 0.0
 
-        # Data tier breakdown: percentage of Primary vs Estimated.
         if total_rows == 0 or self.COL_DATA_TIER not in df.columns:
             primary_pct = 0.0
             estimated_pct = 0.0
         else:
             tier = df[self.COL_DATA_TIER].astype("string").fillna("").str.strip().str.lower()
-            primary_count = int((tier == "primary").sum())
-            estimated_count = int((tier == "estimated").sum())
-            denom = max(primary_count + estimated_count, 1)
-            primary_pct = (primary_count / denom) * 100.0
-            estimated_pct = (estimated_count / denom) * 100.0
+            primary_mask = tier.str.startswith("primary")
+            estimated_mask = tier.str.startswith("estimated")
+            denom = max(int(primary_mask.sum() + estimated_mask.sum()), 1)
+            primary_pct = (int(primary_mask.sum()) / denom) * 100.0
+            estimated_pct = (int(estimated_mask.sum()) / denom) * 100.0
 
         return AuditMetrics(
             total_rows=total_rows,
@@ -127,19 +127,9 @@ class AuditReportGenerator:
         )
 
     def _compute_dataframe_fingerprint(self, df: pd.DataFrame) -> str:
-        """Compute a stable SHA-256 fingerprint for the DataFrame content.
-
-        This is used to make the PDF tamper-evident. The fingerprint is derived from:
-        - column names (in sorted order)
-        - row values (with NaNs normalized)
-
-        Note: This is deterministic for the same DataFrame values.
-        """
-
         if df.empty:
             return hashlib.sha256(b"EMPTY_DF").hexdigest()
 
-        # Stabilize by sorting columns and using CSV serialization with normalized NaNs.
         stable_df = df.copy()
         stable_df = stable_df.reindex(sorted(stable_df.columns), axis=1)
         stable_df = stable_df.replace({np.nan: ""})
@@ -149,16 +139,12 @@ class AuditReportGenerator:
 
     # ---------------------------- PDF setup ----------------------------
     def _create_pdf(self) -> FPDF:
-        """Create and configure the PDF document."""
-
         pdf = FPDF(orientation="P", unit="mm", format="A4")
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
         return pdf
 
     def _write_pdf(self, pdf: FPDF, *, output_path: str) -> None:
-        """Persist the PDF to disk (creates parent directory if needed)."""
-
         out_path = Path(output_path)
         out_dir = out_path.parent
         if str(out_dir) and not out_dir.exists():
@@ -167,11 +153,8 @@ class AuditReportGenerator:
 
     # ---------------------------- Rendering ----------------------------
     def _render_section_header(self, pdf: FPDF, *, timestamp: str, fingerprint: str) -> None:
-        """Section 1: Corporate & immutable identity header."""
-
-        # Watermark-like header line
         pdf.set_font("Helvetica", style="B", size=16)
-        pdf.set_text_color(60, 60, 60)  # dark grey
+        pdf.set_text_color(60, 60, 60)
         pdf.cell(0, 10, self.HEADER_TEXT, ln=1, align="C")
 
         pdf.set_font("Helvetica", size=10)
@@ -186,16 +169,12 @@ class AuditReportGenerator:
         pdf.ln(4)
 
     def _render_section_exec_summary(self, pdf: FPDF, *, metrics: AuditMetrics) -> None:
-        """Section 2: Executive summary aligned to GHG Protocol needs."""
-
         pdf.set_font("Helvetica", style="B", size=12)
         pdf.cell(0, 8, "Executive Summary (GHG Protocol Alignment)", ln=1)
 
         pdf.set_font("Helvetica", size=10)
         pdf.cell(0, 6, f"Total Rows Processed: {metrics.total_rows}", ln=1)
         pdf.cell(0, 6, f"Total Carbon Emissions (tCO2e): {metrics.total_emissions_tco2e:.2f}", ln=1)
-
-        # Critical for 95% compliance threshold visibility
         pdf.cell(
             0,
             6,
@@ -207,66 +186,200 @@ class AuditReportGenerator:
         self._hr(pdf)
         pdf.ln(4)
 
-    def _render_section_exceptions(self, pdf: FPDF, *, df: pd.DataFrame) -> None:
-        """Section 3: Exception audit trail."""
+    def _render_section_detailed_audit(self, pdf: FPDF, *, df: pd.DataFrame) -> None:
+        """Section 3: Explicit result proof table."""
 
         pdf.set_font("Helvetica", style="B", size=12)
-        pdf.cell(0, 8, "Exception Audit Trail", ln=1)
+        pdf.cell(0, 8, "Detailed Shipment Audit", ln=1)
 
-        if df.empty or self.COL_REVIEW_FLAG not in df.columns:
+        if df.empty:
             pdf.set_font("Helvetica", size=10)
-            pdf.multi_cell(0, 6, "Zero exceptions detected. 100% data compliance achieved.")
+            pdf.multi_cell(0, 6, "No shipment rows to audit.")
             return
 
-        flags = df[self.COL_REVIEW_FLAG].astype("string").fillna("").str.strip()
-        exceptions_df = df.loc[flags != "", [c for c in (self.COL_SHIPMENT_ID, self.COL_REVIEW_FLAG) if c in df.columns]]
+        shipment = (
+            df[self.COL_SHIPMENT_ID].astype("string").fillna("").str.strip()
+            if self.COL_SHIPMENT_ID in df.columns
+            else pd.Series("", index=df.index, dtype="string")
+        )
 
-        if exceptions_df.empty:
-            pdf.set_font("Helvetica", size=10)
-            pdf.multi_cell(0, 6, "Zero exceptions detected. 100% data compliance achieved.")
-            return
+        applied_factor = self._resolve_factor_series(df)
+        carbon = self._resolve_carbon_series(df)
+        tier = (
+            df[self.COL_DATA_TIER].astype("string").fillna("").str.strip()
+            if self.COL_DATA_TIER in df.columns
+            else pd.Series("", index=df.index, dtype="string")
+        )
+        review = self._resolve_review_series(df)
 
-        # Render a simple table with two columns
-        shipment_col_w = 45
-        flag_col_w = 0  # extend to margin
+        view = pd.DataFrame(
+            {
+                self.COL_SHIPMENT_ID: shipment,
+                self.COL_APPLIED_FACTOR: applied_factor,
+                self.COL_CARBON: carbon,
+                self.COL_DATA_TIER: tier,
+                self.COL_REVIEW_FLAG: review,
+            }
+        )
 
-        pdf.set_font("Helvetica", style="B", size=10)
-        pdf.set_fill_color(240, 240, 240)
-        pdf.cell(shipment_col_w, 7, "Shipment_ID", border=1, fill=True)
-        pdf.cell(flag_col_w, 7, "Review_Flag", border=1, fill=True, ln=1)
+        # Table layout
+        w_ship = 22
+        w_factor = 24
+        w_carbon = 28
+        w_tier = 48
+        w_flag = 0
+        line_h = 5
 
-        pdf.set_font("Helvetica", size=9)
-        pdf.set_fill_color(255, 255, 255)
+        def _wrap(text: str, width: float) -> list[str]:
+            text = "" if text is None else str(text)
+            text = text.replace("\r", " ").replace("\n", " ").strip()
+            if text == "":
+                return [""]
 
-        for _, row in exceptions_df.iterrows():
-            shipment_id = "" if self.COL_SHIPMENT_ID not in exceptions_df.columns else str(row.get(self.COL_SHIPMENT_ID, ""))
-            review_flag = str(row.get(self.COL_REVIEW_FLAG, ""))
+            words = text.split(" ")
+            lines: list[str] = []
+            current = ""
 
-            # MultiCell breaks layout; we implement a basic wrapped row:
-            # 1) compute line height and wrap the flag text to fit page width.
-            start_x = pdf.get_x()
-            start_y = pdf.get_y()
+            for word in words:
+                trial = word if current == "" else current + " " + word
+                if pdf.get_string_width(trial) <= width:
+                    current = trial
+                else:
+                    if current:
+                        lines.append(current)
+                    if pdf.get_string_width(word) <= width:
+                        current = word
+                    else:
+                        chunk = ""
+                        for ch in word:
+                            trial2 = chunk + ch
+                            if pdf.get_string_width(trial2) <= width:
+                                chunk = trial2
+                            else:
+                                if chunk:
+                                    lines.append(chunk)
+                                chunk = ch
+                        current = chunk
 
-            pdf.multi_cell(shipment_col_w, 6, shipment_id, border=1)
-            row_h = pdf.get_y() - start_y
+            if current:
+                lines.append(current)
 
-            pdf.set_xy(start_x + shipment_col_w, start_y)
-            pdf.multi_cell(0, 6, review_flag, border=1)
+            return lines or [""]
 
-            # Ensure next row starts at the max of the two cells
-            end_y = max(start_y + row_h, pdf.get_y())
-            pdf.set_y(end_y)
+        def _ensure_space(row_h: float) -> None:
+            if pdf.get_y() + row_h > (pdf.h - pdf.b_margin):
+                pdf.add_page()
 
-    def _render_section_title(self, pdf: FPDF, title: str) -> None:
-        """Reusable section title helper (kept for future expansion)."""
+        def _render_header_row() -> None:
+            # Requirement: the PDF must display these exact column names:
+            # ['Shipment_ID', 'Applied_Emission_Factor', 'Carbon_Emission (tCO2e)', 'Data_Tier', 'Review_Flag']
+            headers = [
+                (self.COL_SHIPMENT_ID, w_ship),
+                (self.COL_APPLIED_FACTOR, w_factor),
+                (self.COL_CARBON, w_carbon),
+                (self.COL_DATA_TIER, w_tier),
+                (self.COL_REVIEW_FLAG, (pdf.w - pdf.l_margin - pdf.r_margin - w_ship - w_factor - w_carbon - w_tier)),
+            ]
 
-        pdf.set_font("Helvetica", style="B", size=12)
-        pdf.cell(0, 8, title, ln=1)
+            pdf.set_font("Helvetica", style="B", size=7)
+            pdf.set_fill_color(240, 240, 240)
 
-    # ---------------------------- Utilities ----------------------------
+            x0 = pdf.get_x()
+            y0 = pdf.get_y()
+            header_h = 8
+
+            # Draw header cell borders + background and then write wrapped header text.
+            x = x0
+            for _, w in headers:
+                pdf.rect(x, y0, w, header_h, style="DF")
+                x += w
+
+            x = x0
+            for text, w in headers:
+                lines = _wrap(text, w - 2)
+                pdf.set_xy(x + 1, y0 + 1)
+                pdf.multi_cell(w - 2, 3.5, "\n".join(lines), border=0)
+                x += w
+
+            pdf.set_xy(x0, y0 + header_h)
+            pdf.set_font("Helvetica", size=8)
+            pdf.set_fill_color(255, 255, 255)
+
+        _render_header_row()
+
+        for _, r in view.iterrows():
+            shipment_id = str(r.get(self.COL_SHIPMENT_ID, "") or "").strip()
+
+            f_val = r.get(self.COL_APPLIED_FACTOR, np.nan)
+            if pd.isna(f_val):
+                f_text = "-"
+            else:
+                try:
+                    f_text = f"{float(f_val):.6g}"
+                except Exception:
+                    f_text = "-"
+
+            c_val = r.get(self.COL_CARBON, np.nan)
+            if pd.isna(c_val):
+                c_text = "-"
+            else:
+                try:
+                    c_text = f"{float(c_val):.4f}"
+                except Exception:
+                    c_text = "-"
+
+            tier_text = str(r.get(self.COL_DATA_TIER, "") or "").strip()
+            flag_text = str(r.get(self.COL_REVIEW_FLAG, "") or "").strip()
+
+            ship_lines = _wrap(shipment_id, w_ship - 2)
+            factor_lines = _wrap(f_text, w_factor - 2)
+            carbon_lines = _wrap(c_text, w_carbon - 2)
+            tier_lines = _wrap(tier_text, w_tier - 2)
+            flag_lines = _wrap(
+                flag_text,
+                (pdf.w - pdf.l_margin - pdf.r_margin - w_ship - w_factor - w_carbon - w_tier) - 2,
+            )
+
+            row_lines = max(len(ship_lines), len(factor_lines), len(carbon_lines), len(tier_lines), len(flag_lines))
+            row_h = max(7.0, row_lines * line_h)
+
+            _ensure_space(row_h)
+
+            x0 = pdf.get_x()
+            y0 = pdf.get_y()
+
+            # Draw bordered rectangles
+            pdf.rect(x0, y0, w_ship, row_h)
+            pdf.rect(x0 + w_ship, y0, w_factor, row_h)
+            pdf.rect(x0 + w_ship + w_factor, y0, w_carbon, row_h)
+            pdf.rect(x0 + w_ship + w_factor + w_carbon, y0, w_tier, row_h)
+            pdf.rect(
+                x0 + w_ship + w_factor + w_carbon + w_tier,
+                y0,
+                pdf.w - pdf.r_margin - (x0 + w_ship + w_factor + w_carbon + w_tier),
+                row_h,
+            )
+
+            def _write_cell(x: float, y: float, w: float, lines: list[str]) -> None:
+                pdf.set_xy(x + 1, y + 1)
+                pdf.multi_cell(w - 2, line_h, "\n".join(lines), border=0)
+
+            _write_cell(x0, y0, w_ship, ship_lines)
+            _write_cell(x0 + w_ship, y0, w_factor, factor_lines)
+            _write_cell(x0 + w_ship + w_factor, y0, w_carbon, carbon_lines)
+            _write_cell(x0 + w_ship + w_factor + w_carbon, y0, w_tier, tier_lines)
+            _write_cell(
+                x0 + w_ship + w_factor + w_carbon + w_tier,
+                y0,
+                pdf.w - pdf.r_margin - (x0 + w_ship + w_factor + w_carbon + w_tier),
+                flag_lines,
+            )
+
+            pdf.set_xy(x0, y0 + row_h)
+
+        pdf.ln(1)
+
     def _hr(self, pdf: FPDF) -> None:
-        """Draw a horizontal rule across the content area."""
-
         x1 = pdf.l_margin
         x2 = pdf.w - pdf.r_margin
         y = pdf.get_y()
@@ -276,24 +389,21 @@ class AuditReportGenerator:
 
 
 if __name__ == "__main__":
-    # Minimal local demo
     demo = pd.DataFrame(
         [
             {
                 "Shipment_ID": "S1",
-                "Std_Weight (t)": 10.0,
-                "Std_Distance (km)": 100.0,
-                "Data_Tier": "Primary",
+                "Applied_Emission_Factor": 0.145,
+                "Carbon_Emission (tCO2e)": 0.152345,
+                "Data_Tier": "Primary (Activity-based)",
                 "Review_Flag": "",
-                "Carbon_Emission (tCO2e)": 0.15,
             },
             {
                 "Shipment_ID": "S2",
-                "Std_Weight (t)": np.nan,
-                "Std_Distance (km)": 50.0,
-                "Data_Tier": "Estimated",
-                "Review_Flag": "Needs Manual Review: Weight",
+                "Applied_Emission_Factor": np.nan,
                 "Carbon_Emission (tCO2e)": np.nan,
+                "Data_Tier": "Estimated (Spend-based)",
+                "Review_Flag": "Needs Manual Review: Distance",
             },
         ]
     )
