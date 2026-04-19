@@ -1,26 +1,27 @@
 ﻿"""api/supabase_db.py
 
-Phase 2: Supabase "Rule Memory" for unit mappings.
+Phase 2+: Supabase "Rule Memory" + dynamic Emission Factors.
 
 This module provides a small, robust wrapper around the `supabase` Python client.
 It is intentionally conservative:
 - Uses `streamlit` to read secrets from `st.secrets`.
-- Catches network/cloud exceptions and degrades safely (empty dict / False) so UI
-  never hard-crashes due to transient Supabase issues.
+- Catches network/cloud exceptions and degrades safely (empty dict / False / default
+  EF mapping) so UI never hard-crashes due to transient Supabase issues.
 
-Expected Supabase table:
+Tables expected:
 - unit_mappings
   - tenant_id (text)
   - raw_unit (text)
   - std_unit (text)
   - UNIQUE (tenant_id, raw_unit)
 
+- emission_factors
+  - transport_mode (text)
+  - factor_value (numeric)
+
 Secrets contract (Streamlit):
 - st.secrets["supabase"]["url"]
 - st.secrets["supabase"]["key"]
-
-NOTE: "tamper-proof" is handled at the audit/PDF layer; this module only stores
-unit mapping rules.
 """
 
 from __future__ import annotations
@@ -41,17 +42,22 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_EF_MAPPING: Dict[str, float] = {
+    "road": 0.15,
+    "rail": 0.02,
+    "ocean": 0.01,
+    "air": 1.25,
+}
+
+
 class SupabaseManager:
-    """Supabase access layer for tenant-specific unit mappings."""
+    """Supabase access layer for tenant-specific unit mappings and emission factors."""
 
     _TABLE_UNIT_MAPPINGS = "unit_mappings"
+    _TABLE_EMISSION_FACTORS = "emission_factors"
 
     def __init__(self) -> None:
         """Initialize the Supabase client from Streamlit secrets.
-
-        This constructor must read:
-        - st.secrets["supabase"]["url"]
-        - st.secrets["supabase"]["key"]
 
         If initialization fails, `self.client` becomes None and methods will
         gracefully degrade.
@@ -76,15 +82,11 @@ class SupabaseManager:
             self.client = create_client(url.strip(), key.strip())
             logger.info("SupabaseManager initialized.")
         except Exception as exc:
-            # Do not crash the app on cloud misconfig; fail closed.
             self.client = None
             logger.exception("SupabaseManager init failed (degrading to no-op): %s", exc)
 
     def get_tenant_mappings(self, tenant_id: str) -> Dict[str, str]:
         """Fetch unit mappings for a tenant.
-
-        Args:
-            tenant_id: Tenant identifier.
 
         Returns:
             Dict mapping raw_unit -> std_unit. Returns {} on any failure.
@@ -126,11 +128,6 @@ class SupabaseManager:
 
         Uses upsert to avoid UNIQUE(tenant_id, raw_unit) conflicts.
 
-        Args:
-            tenant_id: Tenant identifier.
-            raw_unit: Raw unit string from user data (e.g., "三大箱").
-            std_unit: Standard unit (e.g., "t").
-
         Returns:
             True if successful, else False.
         """
@@ -154,16 +151,11 @@ class SupabaseManager:
 
             table = self.client.table(self._TABLE_UNIT_MAPPINGS)
 
-            # Prefer explicit conflict target when supported.
             try:
-                resp = table.upsert(payload, on_conflict="tenant_id,raw_unit").execute()
+                table.upsert(payload, on_conflict="tenant_id,raw_unit").execute()
             except TypeError:
-                # Older supabase-py versions may not support on_conflict kw.
-                resp = table.upsert(payload).execute()
+                table.upsert(payload).execute()
 
-            # If Supabase returns a payload, treat as success; otherwise still
-            # consider it successful if no exception was thrown.
-            _ = getattr(resp, "data", None)
             return True
         except Exception as exc:
             logger.exception(
@@ -174,3 +166,46 @@ class SupabaseManager:
                 exc,
             )
             return False
+
+    def get_emission_factors(self) -> Dict[str, float]:
+        """Fetch dynamic emission factors from Supabase.
+
+        Queries `emission_factors` and returns a mapping:
+            {transport_mode(lowercased): factor_value(float)}
+
+        Graceful fallback:
+        - If Supabase is unavailable or query fails, returns DEFAULT_EF_MAPPING.
+        """
+
+        if self.client is None:
+            return DEFAULT_EF_MAPPING.copy()
+
+        try:
+            resp = (
+                self.client.table(self._TABLE_EMISSION_FACTORS)
+                .select("transport_mode,factor_value")
+                .execute()
+            )
+
+            rows = getattr(resp, "data", None)
+            if not rows:
+                return DEFAULT_EF_MAPPING.copy()
+
+            ef: Dict[str, float] = {}
+            for row in rows:
+                mode = str(row.get("transport_mode", "")).strip().lower()
+                value = row.get("factor_value", None)
+
+                if not mode:
+                    continue
+
+                try:
+                    ef[mode] = float(value)
+                except Exception:
+                    continue
+
+            # Ensure we always have at least the fallback.
+            return ef or DEFAULT_EF_MAPPING.copy()
+        except Exception as exc:
+            logger.exception("get_emission_factors failed (fallback to defaults): %s", exc)
+            return DEFAULT_EF_MAPPING.copy()

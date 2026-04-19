@@ -3,3 +3,4 @@ pandas
 numpy
 fpdf2
 openpyxl
+plotly

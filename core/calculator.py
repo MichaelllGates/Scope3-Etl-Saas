@@ -7,7 +7,7 @@ Front-end contract (DO NOT change):
 
 Business rules:
 - Emissions_tCO2e = (weight * distance * factor) / 1000
-- Factors (case-insensitive): road=0.15, rail=0.02, ocean=0.01, air=1.25
+- Factors are provided dynamically (e.g., from Supabase) and matched case-insensitively.
 - Strong downgrade control:
   * If mode is NA/empty or not in factor library: Emissions_tCO2e must be NaN (never raise, never stop).
   * Audit trail via ETL_Review_Flag:
@@ -25,16 +25,44 @@ import numpy as np
 import pandas as pd
 
 
-class Scope3Calculator:
-    _MODE_TO_FACTOR_KGCO2E_PER_TKM: Dict[str, float] = {
-        "road": 0.15,
-        "rail": 0.02,
-        "ocean": 0.01,
-        "air": 1.25,
-    }
+DEFAULT_EF_MAPPING: Dict[str, float] = {
+    "road": 0.15,
+    "rail": 0.02,
+    "ocean": 0.01,
+    "air": 1.25,
+}
 
-    def __init__(self, *, tenant_id: Optional[str] = None):
+
+class Scope3Calculator:
+    def __init__(self, *, tenant_id: Optional[str] = None, ef_mapping: Optional[Dict[str, float]] = None):
+        """Create a calculator.
+
+        Args:
+            tenant_id: Optional tenant identifier for future multi-tenant accounting.
+            ef_mapping: Dynamic emission factor mapping: {mode: factor}.
+                - Keys are matched case-insensitively.
+                - Values must be numeric; non-numeric values are ignored.
+                - If omitted/empty, DEFAULT_EF_MAPPING is used.
+        """
+
         self.tenant_id = tenant_id
+        self.ef_mapping = self._normalize_ef_mapping(ef_mapping)
+
+    def _normalize_ef_mapping(self, ef_mapping: Optional[Dict[str, float]]) -> Dict[str, float]:
+        if not ef_mapping:
+            return DEFAULT_EF_MAPPING.copy()
+
+        normalized: Dict[str, float] = {}
+        for k, v in dict(ef_mapping).items():
+            mode = str(k).strip().lower()
+            if not mode:
+                continue
+            try:
+                normalized[mode] = float(v)
+            except Exception:
+                continue
+
+        return normalized or DEFAULT_EF_MAPPING.copy()
 
     def calculate_emissions(
         self,
@@ -60,7 +88,7 @@ class Scope3Calculator:
         distance_val = pd.to_numeric(result_df[distance_val_col], errors="coerce")
 
         mode_norm = result_df[mode_col].astype("string").str.strip().str.lower()
-        factor = mode_norm.map(self._MODE_TO_FACTOR_KGCO2E_PER_TKM)
+        factor = mode_norm.map(self.ef_mapping)
 
         invalid_mode_mask = mode_norm.isna() | (mode_norm == "") | factor.isna()
 
@@ -139,7 +167,8 @@ if __name__ == "__main__":
         ]
     )
 
-    calc = Scope3Calculator(tenant_id="demo")
+    dynamic_ef = {"road": 0.145, "rail": 0.019, "ocean": 0.011, "air": 1.23}
+    calc = Scope3Calculator(tenant_id="demo", ef_mapping=dynamic_ef)
     out_df = calc.calculate_emissions(
         df=demo_df,
         weight_val_col="Weight",

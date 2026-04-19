@@ -8,6 +8,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
 from api.supabase_db import SupabaseManager
 from core.auditor import AuditReportGenerator
@@ -358,6 +359,7 @@ if raw_df is not None:
             try:
                 with st.spinner("Processing data securely in memory (Zero-Retention)..."):
                     custom_rules = db.get_tenant_mappings(tenant_id=tenant_id)
+                    ef_dict = db.get_emission_factors()
 
                     cleaner = Scope3Cleaner(custom_mapping=custom_rules)
                     cleaned_df = cleaner.clean_logistics_data(
@@ -368,7 +370,7 @@ if raw_df is not None:
 
                     standardized_df = _standardize_for_engine(cleaned_df)
 
-                    calculator = Scope3Calculator(tenant_id=tenant_id)
+                    calculator = Scope3Calculator(tenant_id=tenant_id, ef_mapping=ef_dict)
                     result_df = calculator.calculate_emissions(
                         df=standardized_df,
                         weight_val_col="Std_Weight (t)",
@@ -412,6 +414,92 @@ if raw_df is not None:
 
 result_df = st.session_state.get("result_df")
 if isinstance(result_df, pd.DataFrame):
+    st.markdown("### 📊 Executive Overview")
+
+    emissions_col = None
+    for candidate in ("Carbon_Emission", "Carbon_Emission (tCO2e)", "Emissions_tCO2e"):
+        if candidate in result_df.columns:
+            emissions_col = candidate
+            break
+
+    if emissions_col is None:
+        emissions = pd.Series(np.nan, index=result_df.index, dtype="float")
+    else:
+        emissions = pd.to_numeric(result_df[emissions_col], errors="coerce")
+
+    total_rows = int(len(result_df))
+    total_emissions = float(np.nansum(emissions.to_numpy(dtype=float))) if total_rows else 0.0
+
+    clean_rate = 0.0
+    if total_rows:
+        if "ETL_Review_Flag" in result_df.columns:
+            flags = result_df["ETL_Review_Flag"].astype("string").fillna("").str.strip()
+            clean_rate = float((flags == "Clean").mean() * 100.0)
+        elif "Review_Flag" in result_df.columns:
+            flags = result_df["Review_Flag"].astype("string").fillna("").str.strip()
+            clean_rate = float(((flags == "Clean") | (flags == "")).mean() * 100.0)
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("Total Rows Processed", f"{total_rows}")
+    with k2:
+        st.metric("Total Carbon Emissions", f"{total_emissions:.2f}")
+    with k3:
+        st.metric("Clean Data Rate", f"{clean_rate:.1f}%")
+
+    if emissions.notna().any():
+        c_left, c_right = st.columns(2)
+
+        with c_left:
+            if "Transport_Mode" in result_df.columns:
+                by_mode = pd.DataFrame(
+                    {"Transport_Mode": result_df["Transport_Mode"], "Carbon_Emission": emissions}
+                ).dropna(subset=["Carbon_Emission"])
+                if by_mode.empty:
+                    st.warning("No valid emissions to chart by mode.")
+                else:
+                    mode_sum = (
+                        by_mode.groupby("Transport_Mode", dropna=False)["Carbon_Emission"]
+                        .sum(min_count=1)
+                        .reset_index()
+                    )
+                    mode_sum["Transport_Mode"] = mode_sum["Transport_Mode"].astype("string").fillna("(Missing)")
+                    fig1 = px.pie(
+                        mode_sum,
+                        names="Transport_Mode",
+                        values="Carbon_Emission",
+                        hole=0.4,
+                        title="Emissions by Mode",
+                    )
+                    st.plotly_chart(fig1, use_container_width=True)
+            else:
+                st.warning("Missing column: Transport_Mode")
+
+        with c_right:
+            if "Shipment_ID" in result_df.columns:
+                hotspots = pd.DataFrame(
+                    {"Shipment_ID": result_df["Shipment_ID"], "Carbon_Emission": emissions}
+                )
+                hotspots = (
+                    hotspots.dropna(subset=["Carbon_Emission"])
+                    .sort_values("Carbon_Emission", ascending=False)
+                    .head(5)
+                )
+                if hotspots.empty:
+                    st.warning("No valid emissions to chart hotspots.")
+                else:
+                    fig2 = px.bar(
+                        hotspots,
+                        x="Shipment_ID",
+                        y="Carbon_Emission",
+                        title="Top 5 Carbon Hotspots",
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.warning("Missing column: Shipment_ID")
+    else:
+        st.warning("No emissions available for charts (all values are NaN).")
+
     st.markdown("#### Results")
 
     if "ETL_Review_Flag" in result_df.columns:
@@ -471,3 +559,5 @@ with st.expander("🧠 Teach the Engine (Add Custom Unit Mapping)", expanded=Fal
                 st.success("Rule saved! The engine will remember this next time.")
             else:
                 st.error("Failed to save rule. Check Supabase secrets/network and try again.")
+
+
